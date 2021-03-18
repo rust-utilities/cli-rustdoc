@@ -1,0 +1,46 @@
+# cli-rustdoc completion
+
+_cli_rustdoc() {
+    local cur prev words cword split
+    _init_completion || return
+
+    # default completion if parameter looks like a path
+    if [[ "${cur}" == @(*/|[.~])* ]]; then
+        _filedir
+        return
+    fi
+
+    case "${prev}" in
+        -h|--help|-k|--keep|-l|--license|-v|--verbose|-V|--version|-r|--rebuild)
+            return
+        ;;
+        -c|--config|-d|--directory)
+            _filedir
+            return
+        ;;
+        -b|--browser)
+            words=(words[0] "${cur}")
+            cword=1
+            _command
+            return
+        ;;
+        --section)
+            COMPREPLY=( $( compgen -W 'dependencies' -- ${cur} ) )
+            return
+        ;;
+        --package)
+            COMPREPLY=( $( compgen -W 'version_operators' -- ${cur} ) )
+            return
+        ;;
+    esac
+
+    # Parse help for any un-matched parameters
+    if [[ ${cur} == -* ]]; then
+        COMPREPLY=( $( compgen -W '$( _parse_help "${1}" )' -- "${cur}" ) )
+        [[ ${COMPREPLY} == *= ]] && compopt -o nospace
+        return
+    fi
+} &&
+complete -F _cli_rustdoc cli-rustdoc
+
+# ex: filetype=bash

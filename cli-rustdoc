@@ -1,0 +1,416 @@
+#!/usr/bin/env bash
+
+
+## Find true directory this script resides in
+__SOURCE__="${BASH_SOURCE[0]}"
+while [[ -h "${__SOURCE__}" ]]; do
+    __SOURCE__="$(find "${__SOURCE__}" -type l -ls | sed -n 's@^.* -> \(.*\)@\1@p')"
+done
+__NAME__="${__SOURCE__##*/}"
+__DIR__="$(cd -P "$(dirname "${__SOURCE__}")" && pwd)"
+__AUTHOR__='S0AndS0'
+__DESCRIPTION__='Builds/finds documentation for Rust package or library'
+
+
+set -Ee -o functrace
+
+
+## Provides: failure
+# shellcheck source=shared_functions/modules/trap-failure/failure.sh
+source "${__DIR__}/shared_functions/modules/trap-failure/failure.sh"
+trap 'failure "LINENO" "BASH_LINENO" "${BASH_COMMAND}" "${?}"' ERR
+
+## Provides: argument_parser <arg-array-reference> <acceptable-arg-reference>
+# shellcheck source=shared_functions/modules/argument-parser/argument-parser.sh
+source "${__DIR__}/shared_functions/modules/argument-parser/argument-parser.sh"
+
+## Provides: __license__ <description> <author>
+# shellcheck source=shared_functions/license.sh
+source "${__DIR__}/shared_functions/license.sh"
+
+
+##
+#
+_browser='lynx'
+_config="${__DIR__}/.config-cli-rustdoc"
+_section='dependencies'
+
+
+__usage__() {
+    local _message="${1}"
+    cat <<EOF
+${__DESCRIPTION__}
+
+
+Usage: ${__NAME__} [OPTIONS]...
+
+
+Options:
+-h    --help
+    Prints this message and exits
+
+-k    --keep
+    Keeps package dependency configuration and temporary directory
+
+-l    --license
+    Prints copyright for this script and exits
+
+-v    --verbose
+    Prints messages about actions
+
+-V    --version
+    Prints version for this script and exits
+
+-r    --rebuild
+    Rebuilds documentation files
+
+-b    --browser "lynx"
+    Web browser to open documentation with, default "lynx"
+
+-c    --config "~/git/hub/rust-utilities/cli-rustdoc/.config-cli-rustdoc"
+    Configuration file path, default "\${__DIR__}/.cli-rustdoc-config"
+
+-d    --directory "~/.local/share/cli-rustdoc"
+    Project directory to build documentation files;
+    if Cargo.toml exists defaults to "\${PWD}",
+    else generates temporary directory via "\$(mktemp --directory)"
+
+--section "${_section:-dependencies}"
+    Name of dependency section to inject package name
+
+--package "${_package:-version_operators}"
+    Name of package to view documentation for.
+    Note, the "--package" paramater is optional
+
+
+Examples:
+    ${__NAME__} 'version_operators'
+EOF
+
+    if (( _made_tmp_dir )); then
+        rmdir "${_directory}"
+    fi
+
+    if (( _verbose )); then
+        printf '\nParsed Options:\n'
+        local _key
+        local _arg_option
+        local _arg_name
+        local _variable_name
+        local _variable_value
+        for _arg_option in "${_acceptable_args[@]}"; do
+            _arg_name="$(awk -F'[|:]' '{ print $1; }' <<<${_arg_option})"
+            _variable_name="$(awk '{
+                gsub("-", "_", $0);
+                print $0;
+            }' <<<"${_arg_name[@]:1}")"
+            _variable_value="${!_variable_name}"
+
+            if (( "${#_variable_value}" )); then
+                printf '    %s %s\n' "${_arg_name}" "${_variable_value}"
+            fi
+        done
+    fi
+
+    if (( "${#_message}" )); then
+        printf >&2 '\n\n## Error: %s\n' "${_message}"
+        exit 1
+    fi
+}
+
+
+__version__() {
+    local _version_number
+    _version_number="$(git tag --list v* | tail -n1)"
+    _version_number="${_version_number:-v0.0.1}"
+    _version_number="${_version_number//[^0-9.]/}"
+
+    printf '%s - %s\n' "${__NAME__}" "${_version_number}"
+    __license__ "${__DESCRIPTION__}"
+    printf '\nWritten by %s\n' "${__AUTHOR__}"
+}
+
+
+## Save passed arguments and acceptable arguments to Bash arrays
+# shellcheck disable=SC2034
+{
+    _passed_args=( "${@:?No arguments provided}" )
+    _acceptable_args=(
+        '--help|-h:bool'
+        '--keep|-k:bool'
+        '--license|-l:bool'
+        '--rebuild|-r:bool'
+        '--verbose|-v:bool'
+        '--version|-V:bool'
+        '--browser|-b:print'
+        '--config|-c|-c:path'
+        '--directory|-d:path'
+        '--section|-s:print'
+        '--package:print-nil'
+    )
+}
+
+## Pass arrays by reference/name to the `argument_parser` function
+argument_parser '_passed_args' '_acceptable_args'
+_exit_status="${?}"
+
+if (( "${#_config}" )) && [[ -f "${_config}" ]]; then
+    # shellcheck disable=SC1090
+    source "${_config}"
+fi
+
+## Re-parse arguments to allow overwriting configurations
+argument_parser '_passed_args' '_acceptable_args'
+_exit_status="${?:-${_exit_status}}"
+
+
+# shellcheck disable=SC2154
+(( _help )) || (( _exit_status )) && {
+    __usage__
+    exit "${_exit_status:-0}"
+}
+
+# shellcheck disable=SC2154
+(( _license )) && {
+    printf '%s\n' "${__DESCRIPTION__}"
+    __license__
+    exit ${_exit_status:-0}
+}
+
+# shellcheck disable=SC2154
+(( _version )) && {
+    __version__
+    exit ${_exit_status:-0}
+}
+
+(( "${#_package}" )) || {
+    __usage__ 'No package name provided'
+}
+
+
+[[ -d "${_directory}" ]] || {
+    mkdir -p "${_directory}"
+}
+
+
+# ========================================================================== #
+# ========================================================================== #
+
+
+##
+#
+not_package_listed_dependency() {
+    local _package="${1:?No package name provided}"
+    local _section="${2:-dependencies}"
+    local _directory="${3:-${_directory}}"
+
+    awk -v _package="${_package}" -v _section="${_section}" 'BEGIN {
+        _after_dependencies = 0;
+        _found_pattern = 0;
+        _pattern = "^" _package "\\s+=\\s+";
+    }
+
+    {
+        if ($0 == "[" _section "]") {
+            _after_dependencies = 1;
+            next;
+        }
+
+        if (_after_dependencies) {
+            if ($0 ~ _pattern) {
+                  _found_pattern = 1;
+                  exit 0;
+              } else if ($0 ~ "^\\[(([a-zA-Z]+)[.]?([a-zA-Z]+))+\\]") {
+                  exit 1;
+              }
+        }
+    }
+
+    END {
+        if (!_found_pattern) {
+            exit 0;
+        }
+        exit 1;
+    }' "${_directory}/Cargo.toml"
+
+    local _status="${?}"
+    if (( _status )); then
+        return 1
+    fi
+    return 0
+}
+
+
+##
+#
+inject_dependency() {
+    local _package="${1:?No package name provided}"
+    local _section="${2:-dependencies}"
+    local _directory="${3:-${_directory}}"
+
+    local _package_depends_config="$(cargo search "${_package}" | awk '{
+        print $1, $2, $3;
+        exit 0;
+    }')"
+
+    if ! (( "${#_package_depends_config}" )); then
+        __usage__ "Cargo cannot find package -> ${_package}"
+    fi
+
+    local _configs_before_dependencies="$(awk -v _section="${_section}" '{
+        print $0;
+        if ($0 == "[" _section "]") {
+            exit 0;
+        }
+    }' "${_directory}/Cargo.toml")"
+
+    local _configs_after_dependencies="$(awk -v _section="${_section}" 'BEGIN {
+        _after_dependencies = 0;
+    }
+
+    {
+        if ($0 == "[" _section "]") {
+            _after_dependencies = 1;
+            # next;
+        } else if (_after_dependencies) {
+            print $0;
+        }
+    }' "${_directory}/Cargo.toml")"
+
+    if (( "${#_configs_after_dependencies}" )); then
+        tee "${_directory}/Cargo.toml" 1>/dev/null <<EOF
+${_configs_before_dependencies}
+${_package_depends_config}
+${_configs_after_dependencies}
+EOF
+    else
+        tee "${_directory}/Cargo.toml" 1>/dev/null <<EOF
+${_configs_before_dependencies}
+
+[${_section}]
+${_package_depends_config}
+EOF
+    fi
+}
+
+
+##
+#
+remove_dependency() {
+    local _package="${1:?No package name provided}"
+    local _section="${2:-dependencies}"
+    local _directory="${3:-${_directory}}"
+
+    local _configs_before_dependency="$(awk -v _package="${_package}" -v _section="${_section}" 'BEGIN {
+        _after_dependencies = 0;
+        _pattern = "^" _package "\\s+=\\s+";
+    }
+
+    {
+        if ($0 == "[" _section "]") {
+            print $0;
+            _after_dependencies = 1;
+            next;
+        }
+
+        if (_after_dependencies) {
+            if ($0 ~ _pattern) {
+                  exit 0;
+              } else {
+                  print $0;
+              }
+        }
+    }' "${_directory}/Cargo.toml")"
+
+    local _configs_after_dependency="$(awk -v _package="${_package}" -v _section="${_section}" 'BEGIN {
+        _found_pattern = 0;
+        _after_dependencies = 0;
+        _pattern = "^" _package "\\s+=\\s+";
+    }
+
+    {
+        if ($0 == "[" _section "]") {
+            _after_dependencies = 1;
+            print $0;
+        } else if (_after_dependencies) {
+            if ($0 ~ _pattern) {
+                _found_pattern = 1;
+            } else if (_found_pattern) {
+                print $0;
+            }
+        }
+    }' "${_directory}/Cargo.toml")"
+
+    tee "${_directory}/Cargo.toml" 1>/dev/null <<EOF
+${_configs_before_dependency}
+${_configs_after_dependency}
+EOF
+}
+
+
+# ========================================================================== #
+# ========================================================================== #
+
+
+if ! (( "${#_directory}" )); then
+    if ! [[ -f "${PWD}/Cargo.toml" ]]; then
+        _directory="$(mktemp --directory)"
+        _made_tmp_dir=1
+    else
+        _directory="${PWD}"
+    fi
+fi
+
+
+pushd "${_directory}"
+
+
+[[ -f "${_directory}/Cargo.toml" ]] || {
+    _directory_name="${_directory##*/}"
+    if (( _made_tmp_dir )); then
+        _directory_name="${_directory_name//[^[:alnum:]]/}"
+    fi
+
+    if (( _verbose )); then
+        printf '_directory_name -> %s\n' "${_directory_name}"
+    fi
+
+    cargo init --name "${_directory_name}"
+}
+
+
+_doc_path="${_directory}/target/doc/${_package}/index.html"
+if [[ -d "${_doc_path%/*}" ]] && { (( _rebuild )) || ! [[ -f "${_doc_path}" ]]; }; then
+    cargo doc -p "${_package}"
+elif not_package_listed_dependency "${_package}" "${_section}" "${_directory}"; then
+    _added_package=1
+    inject_dependency "${_package}" "${_section}" "${_directory}"
+
+    cargo doc -p "${_package}"
+else
+    printf 'Found package %s\n' "${_package}"
+fi
+
+
+popd
+
+
+if [[ -f "${_doc_path}" ]]; then
+    "${_browser}" "${_doc_path}"
+else
+    __usage__ "No documentation path found -> ${_doc_path}"
+fi
+
+
+if ! (( _keep )); then
+    if (( _verbose )); then
+        printf >&2 'Removing temporary directory and/or dependency configuration\n'
+    fi
+
+    if (( _made_tmp_dir )); then
+        rm -rf "${_directory}"
+    elif (( _added_package )); then
+        remove_dependency "${_package}" "${_section}" "${_directory}"
+    fi
+fi
+
